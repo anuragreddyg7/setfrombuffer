@@ -2,3 +2,6 @@
 dist/
 vendor/
 *.swp
+
+# local coverage outputs
+valkeycompat/cover.out

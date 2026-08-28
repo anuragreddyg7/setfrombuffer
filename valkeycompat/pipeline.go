@@ -434,6 +434,15 @@ func (c *Pipeline) Set(ctx context.Context, key string, value any, expiration ti
 	return ret
 }
 
+func (c *Pipeline) SetFromBuffer(ctx context.Context, key string, buf []byte) *StatusCmd {
+	// SetFromBuffer forwards the call to the underlying Compat implementation.
+	// It appends the returned StatusCmd to the pipeline results so it will be
+	// executed during Exec/Flush.
+	ret := c.comp.SetFromBuffer(ctx, key, buf)
+	c.rets = append(c.rets, ret)
+	return ret
+}
+
 func (c *Pipeline) SetArgs(ctx context.Context, key string, value any, a SetArgs) *StatusCmd {
 	ret := c.comp.SetArgs(ctx, key, value, a)
 	c.rets = append(c.rets, ret)

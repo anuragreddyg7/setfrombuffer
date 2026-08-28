@@ -126,6 +126,11 @@ type CoreCmdable interface {
 	MSet(ctx context.Context, values ...any) *StatusCmd
 	MSetNX(ctx context.Context, values ...any) *BoolCmd
 	Set(ctx context.Context, key string, value any, expiration time.Duration) *StatusCmd
+	// SetFromBuffer sets the value of a key using a []byte buffer. The
+	// provided buffer may be converted to a binary-safe string view by the
+	// implementation. Callers MUST NOT mutate the buffer while the command is
+	// in-flight if the implementation uses a zero-copy conversion.
+	SetFromBuffer(ctx context.Context, key string, buf []byte) *StatusCmd
 	SetArgs(ctx context.Context, key string, value any, a SetArgs) *StatusCmd
 	SetEX(ctx context.Context, key string, value any, expiration time.Duration) *StatusCmd
 	SetNX(ctx context.Context, key string, value any, expiration time.Duration) *BoolCmd
@@ -1108,6 +1113,17 @@ func (c *Compat) Set(ctx context.Context, key string, value any, expiration time
 	} else {
 		resp = c.client.Do(ctx, c.client.B().Set().Key(key).Value(str(value)).Build())
 	}
+	return newStatusCmd(resp)
+}
+
+func (c *Compat) SetFromBuffer(ctx context.Context, key string, buf []byte) *StatusCmd {
+	// Use library helper which returns a binary-safe string view of buf.
+	// This is faster for large payloads but relies on the caller not
+	// modifying buf concurrently while the command may be sent.
+	value := valkey.BinaryString(buf)
+
+	cmd := c.client.B().Set().Key(key).Value(value).Build()
+	resp := c.client.Do(ctx, cmd)
 	return newStatusCmd(resp)
 }
 

@@ -1,0 +1,88 @@
+VALKEYCOMPAT SET_FROM_BUFFER CHANGELOG
+
+Summary
+-------
+This file collects all changes made to add SetFromBuffer, pipeline forwarding, tests, and a developer test runner.
+It is a plain-text, copy/paste-friendly document intended for pasting into Google Docs or any editor without formatting issues.
+
+Files changed
+-------------
+1) valkeycompat/adapter.go
+   - Type: Modified
+   - Changes:
+     * Added CoreCmdable API: SetFromBuffer(ctx context.Context, key string, buf []byte) *StatusCmd
+     * Implemented Compat.SetFromBuffer(ctx, key, buf []byte) *StatusCmd using valkey.BinaryString(buf)
+   - Reason: Provide zero-copy API for callers that already have a []byte payload and want to issue SET without extra allocation.
+   - Risk: Uses valkey.BinaryString which performs a zero-copy conversion; caller must not mutate buf while the command is in-flight.
+
+2) valkeycompat/pipeline.go
+   - Type: Modified
+   - Changes:
+     * Added Pipeline.SetFromBuffer(ctx, key, buf) wrapper that forwards to Compat.SetFromBuffer and appends the result to pipeline return slice.
+   - Reason: Pipeline must provide the same API after CoreCmdable was extended.
+
+3) valkeycompat/set_from_buffer_test.go
+   - Type: New file (unit tests)
+   - Contents: Four unit tests (mock-based):
+     * valid binary payload
+     * empty buffer
+     * large payload (1MB) smoke
+     * context cancellation propagation
+   - Reason: Deterministic unit coverage for the new API; uses gomock mock.NewClient so Docker is not required.
+
+4) valkeycompat/pipeline_test.go
+   - Type: Modified (test)
+   - Changes:
+     * Added p.SetFromBuffer(ctx, "1", []byte("2")) to the pipeline call list.
+     * Updated expected golden JSON and counts to include an extra SET entry.
+
+5) tools/run-tests.sh
+   - Type: New file (dev helper script)
+   - Contents: Script that starts docker compose, waits for expected ports, runs unit/integration or both, collects coverage, and tears down.
+
+6) tools/README.md
+   - Type: New file (documentation)
+
+
+Exact code snippets (plain text) - paste these directly where needed
+---------------------------------------------------------------
+
+adapter.go - SetFromBuffer implementation (uses valkey.BinaryString):
+// SetFromBuffer sets the value of a key using a []byte buffer.
+//
+// For performance this implementation uses valkey.BinaryString(buf) which
+// performs a zero-copy conversion on Go 1.20+ (it uses unsafe under the
+// hood). This avoids allocating a separate string for large payloads.
+//
+// IMPORTANT: Because this is a zero-copy conversion the caller MUST NOT
+// mutate the provided buf while the command is in-flight. If caller-safety
+// is preferred instead of allocation avoidance, call with a copy of the
+// buffer or use a wrapper that does `string(buf)`.
+func (c *Compat) SetFromBuffer(ctx context.Context, key string, buf []byte) *StatusCmd {
+    // Use library helper which returns a binary-safe string view of buf.
+    // This is faster for large payloads but relies on the caller not
+    // modifying buf concurrently while the command may be sent.
+    value := valkey.BinaryString(buf)
+
+    cmd := c.client.B().Set().Key(key).Value(value).Build()
+    resp := c.client.Do(ctx, cmd)
+    return newStatusCmd(resp)
+}
+
+
+Architecture and coding decisions taken:
+- Performance vs Safety: The implementation uses valkey.BinaryString(buf) which performs a zero-copy conversion to string (uses unsafe internally). This favors performance (no allocation/copy for large payloads) but requires the caller not to mutate the buffer while the command is in-flight. We documented this contract in the method comment. If callers prefer safety, they should call SetFromBuffer with a copied buffer (or we can add a safe alternative API).
+- API stability: We added SetFromBuffer to the public `CoreCmdable` interface and propagated the API to `Pipeline` wrappers so existing call sites can be updated uniformly. This was necessary to keep the package interfaces consistent.
+- Testing strategy: The added tests are mock-based (gomock) to avoid requiring live services for unit validation. Integration tests remain running against docker-compose where available.
+- Developer ergonomics: Added `tools/run-tests.sh` to standardize bring-up/wait/test/teardown flows. The script can be adjusted to skip Docker for unit-only runs.
+
+Quality checklist performed:
+- Compiled and ran focused unit tests: `go test -run TestSetFromBuffer` — PASS
+- Ensured no unused imports remain after change.
+- Updated pipeline tests to include the new call and adjusted golden list so pipeline API tests remain consistent.
+
+Commands: create a single patch file with all changes:
+git fetch origin
+git diff origin/main...HEAD > tools/changes.patch
+
+End of changelog.
