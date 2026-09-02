@@ -27,14 +27,21 @@
 package valkeycompat
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"math"
+	"net"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
+
+	"errors"
+
+	"github.com/valkey-io/valkey-go/mock"
+	"go.uber.org/mock/gomock"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -54,6 +61,236 @@ func (t *TimeValue) ScanValkey(s string) (err error) {
 func TestAdapter(t *testing.T) {
 	RegisterFailHandler(Fail)
 	RunSpecs(t, "Adapter Suite")
+}
+
+func TestSetFromBuffer_Adapter(t *testing.T) {
+	// helper that asserts the exact SET command shape
+	assertSetFromBufferCmd := func(t *testing.T, cmds []string, key string, payload []byte) {
+		t.Helper()
+		exp := valkey.BinaryString(payload)
+		if len(cmds) < 3 {
+			t.Fatalf("SET needs 3 args, got %v", cmds)
+		}
+		if cmds[0] != "SET" || cmds[1] != key || cmds[2] != exp {
+			t.Fatalf("want SET %q %q, got %v", key, exp, cmds)
+		}
+	}
+	t.Run("binary payload round-trip", func(t *testing.T) {
+		ctrl := gomock.NewController(t)
+		defer ctrl.Finish()
+
+		client := mock.NewClient(ctrl)
+		adapter := NewAdapter(client)
+
+		key := "sfb-basic"
+		payload := []byte{0x00, 0x01, 0xff}
+
+		// capture the Completed command and assert exact shape
+		client.EXPECT().Do(gomock.Any(), gomock.Any()).DoAndReturn(func(ctx context.Context, c valkey.Completed) valkey.ValkeyResult {
+			cmds := c.Commands()
+			assertSetFromBufferCmd(t, cmds, key, payload)
+			return mock.Result(mock.ValkeyString("OK"))
+		})
+		cmd := adapter.SetFromBuffer(context.Background(), key, payload)
+		ok, err := cmd.Result()
+		if err != nil {
+			t.Fatalf("Result err: %v", err)
+		}
+		if ok != "OK" {
+			t.Fatalf("Result() = %q, want OK", ok)
+		}
+	})
+
+	t.Run("empty buffer", func(t *testing.T) {
+		ctrl := gomock.NewController(t)
+		defer ctrl.Finish()
+
+		client := mock.NewClient(ctrl)
+		adapter := NewAdapter(client)
+
+		key := "sfb-empty"
+		payload := []byte{}
+
+		client.EXPECT().Do(gomock.Any(), gomock.Any()).DoAndReturn(func(ctx context.Context, c valkey.Completed) valkey.ValkeyResult {
+			cmds := c.Commands()
+			assertSetFromBufferCmd(t, cmds, key, payload)
+			return mock.Result(mock.ValkeyString("OK"))
+		})
+		cmd := adapter.SetFromBuffer(context.Background(), key, payload)
+		ok, err := cmd.Result()
+		if err != nil {
+			t.Fatalf("Result err: %v", err)
+		}
+		if ok != "OK" {
+			t.Fatalf("Result() = %q, want OK", ok)
+		}
+	})
+
+	t.Run("large payload", func(t *testing.T) {
+		ctrl := gomock.NewController(t)
+		defer ctrl.Finish()
+
+		client := mock.NewClient(ctrl)
+		adapter := NewAdapter(client)
+
+		key := "sfb-large"
+		payload := []byte(strings.Repeat("x", 1<<20))
+
+		client.EXPECT().Do(gomock.Any(), gomock.Any()).DoAndReturn(func(ctx context.Context, c valkey.Completed) valkey.ValkeyResult {
+			cmds := c.Commands()
+			assertSetFromBufferCmd(t, cmds, key, payload)
+			return mock.Result(mock.ValkeyString("OK"))
+		})
+		cmd := adapter.SetFromBuffer(context.Background(), key, payload)
+		ok, err := cmd.Result()
+		if err != nil {
+			t.Fatalf("Result err: %v", err)
+		}
+		if ok != "OK" {
+			t.Fatalf("Result() = %q, want OK", ok)
+		}
+	})
+
+	t.Run("context cancellation propagates", func(t *testing.T) {
+		ctrl := gomock.NewController(t)
+		defer ctrl.Finish()
+
+		client := mock.NewClient(ctrl)
+		adapter := NewAdapter(client)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+
+		client.EXPECT().Do(gomock.Any(), gomock.Any()).DoAndReturn(func(got context.Context, _ valkey.Completed) valkey.ValkeyResult {
+			if got.Err() != context.Canceled {
+				t.Errorf("Do ctx.Err() = %v, want Canceled", got.Err())
+			}
+			return mock.ErrorResult(context.Canceled)
+		})
+		err := adapter.SetFromBuffer(ctx, "test-cancel", []byte("payload")).Err()
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("got %v, want context.Canceled", err)
+		}
+	})
+
+	t.Run("pipeline panic", func(t *testing.T) {
+		ctrl := gomock.NewController(t)
+		defer ctrl.Finish()
+
+		client := mock.NewClient(ctrl)
+		// create a pipeline wrapper that uses our adapter
+		p := NewAdapter(client).Pipeline()
+		defer func() {
+			r := recover()
+			if r == nil {
+				t.Fatalf("expected panic when calling SetFromBuffer on Pipeline")
+			}
+			msg := fmt.Sprint(r)
+			if !strings.Contains(msg, "Pipeline") {
+				t.Fatalf("panic = %q", msg)
+			}
+		}()
+		// this should panic per the policy
+		_ = p.SetFromBuffer(context.Background(), "k", []byte("v"))
+	})
+
+	t.Run("txpipeline panic", func(t *testing.T) {
+		ctrl := gomock.NewController(t)
+		defer ctrl.Finish()
+
+		client := mock.NewClient(ctrl)
+		adapter := NewAdapter(client)
+
+		defer func() {
+			r := recover()
+			if r == nil {
+				t.Fatalf("expected panic when calling SetFromBuffer on TxPipeline")
+			}
+			msg := fmt.Sprint(r)
+			if !strings.Contains(msg, "TxPipeline") {
+				t.Fatalf("panic = %q", msg)
+			}
+		}()
+		// this should panic per the policy
+		_ = adapter.TxPipeline().SetFromBuffer(context.Background(), "k", []byte("v"))
+	})
+}
+
+// Integration tests that require a live Valkey server running on localhost:6379.
+// These are skipped automatically if no server is reachable.
+func TestSetFromBuffer_Integration(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	client, err := valkey.NewClient(valkey.ClientOption{
+		InitAddress:  []string{"127.0.0.1:6378"},
+		DisableRetry: true,
+		Dialer:       net.Dialer{Timeout: time.Second},
+	})
+	if err != nil {
+		t.Skipf("no server on 6378: %v", err)
+	}
+	defer client.Close()
+
+	adapter := NewAdapter(client)
+	// Use Ping as a reliable skip gate (some NewClient setups don't verify)
+	if err := adapter.Ping(ctx).Err(); err != nil {
+		t.Skipf("no server on 6378: %v", err)
+	}
+
+	t.Run("Live Binary Payload", func(t *testing.T) {
+		key := "int-sfb-binary"
+		payload := []byte{0x00, 0x01, 0xFF, 0xFE, 0xFD}
+
+		if err := adapter.SetFromBuffer(ctx, key, payload).Err(); err != nil {
+			t.Fatalf("expected nil error, got %v", err)
+		}
+
+		res, err := adapter.Get(ctx, key).Bytes()
+		if err != nil {
+			t.Fatalf("expected nil error during Get, got %v", err)
+		}
+
+		if !bytes.Equal(payload, res) {
+			t.Fatalf("expected %v, got %v", payload, res)
+		}
+	})
+
+	t.Run("Live Empty Buffer", func(t *testing.T) {
+		key := "int-sfb-empty"
+		payload := []byte{}
+
+		if err := adapter.SetFromBuffer(ctx, key, payload).Err(); err != nil {
+			t.Fatalf("expected nil error on empty buffer, got %v", err)
+		}
+
+		res, err := adapter.Get(ctx, key).Bytes()
+		if err != nil {
+			t.Fatalf("expected nil error during Get, got %v", err)
+		}
+
+		if len(res) != 0 {
+			t.Fatalf("expected empty response, got length %d", len(res))
+		}
+	})
+
+	t.Run("Live Overwrite", func(t *testing.T) {
+		key := "int-sfb-overwrite"
+
+		// Set initial value
+		adapter.Set(ctx, key, "initial-data", 0)
+
+		// Overwrite from buffer
+		newPayload := []byte("overwritten-data")
+		if err := adapter.SetFromBuffer(ctx, key, newPayload).Err(); err != nil {
+			t.Fatalf("expected nil error on overwrite, got %v", err)
+		}
+
+		res, _ := adapter.Get(ctx, key).Bytes()
+		if !bytes.Equal(newPayload, res) {
+			t.Fatalf("expected %v, got %v", newPayload, res)
+		}
+	})
 }
 
 var (

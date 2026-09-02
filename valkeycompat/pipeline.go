@@ -464,6 +464,12 @@ func (c *Pipeline) SetRange(ctx context.Context, key string, offset int64, value
 	return ret
 }
 
+// SetFromBuffer is not supported for Pipeline because it performs a zero-copy
+// conversion of the provided buffer to string which cannot be safely deferred.
+func (c *Pipeline) SetFromBuffer(ctx context.Context, key string, buf []byte) *StatusCmd {
+	panic("SetFromBuffer is not supported in Pipeline (zero-copy buffer conversion)")
+}
+
 func (c *Pipeline) StrLen(ctx context.Context, key string) *IntCmd {
 	ret := c.comp.StrLen(ctx, key)
 	c.rets = append(c.rets, ret)

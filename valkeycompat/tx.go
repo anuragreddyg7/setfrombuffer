@@ -147,3 +147,10 @@ func (t *tx) Close(_ context.Context) error {
 	t.cancel()
 	return nil
 }
+
+// SetFromBuffer is intentionally unsupported in TxPipeline for the same
+// reasons as Pipeline.SetFromBuffer: zero-copy buffer conversions cannot be
+// safely deferred. Panic to make misuse explicit.
+func (c *TxPipeline) SetFromBuffer(ctx context.Context, key string, buf []byte) *StatusCmd {
+	panic("SetFromBuffer is not supported in TxPipeline (zero-copy buffer conversion)")
+}
